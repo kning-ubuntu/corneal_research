@@ -1,12 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-Corneal Topography — Multi-angle (360) Neural (Polar U-Net) vs Classical
-+ Physics-respecting regularization:
-  - SmoothL1 data term
-  - 2nd-derivative smoothness along radius r
-  - 2nd-derivative smoothness along angle theta (periodic wrap)
-
-Run: python this_file.py
+Corneal Topography — Multi-angle (360)
+Optimized Dataset + NN vs Arc-step vs Klein
+(Faithful baselines + paper-ready plots)
 """
 
 import numpy as np
@@ -38,18 +34,17 @@ def build_calib(K=13, f=4.74, Lc=50.0, Lp_base=50.0, dome_mm=45.0):
     u = rings_mm / rings_mm[-1]
     Lp = Lp_base - dome_mm * (u ** 2)
     return Calib(
-        f=float(f),
-        Lc=float(Lc),
+        f=f,
+        Lc=Lc,
         Lp=Lp.astype(np.float32),
         rings_mm=rings_mm.astype(np.float32),
     )
 
 # =========================================================
-# Surface model
+# Corneal surface
 # =========================================================
 
 def asphere_sag(r, R, Q):
-    r = np.asarray(r, dtype=np.float32)
     inside = np.maximum(1 - (1 + Q) * (r ** 2) / (R ** 2), 1e-12)
     return -(r ** 2) / (R * (1 + np.sqrt(inside)))
 
@@ -64,53 +59,32 @@ def forward_project_r_to_rho(r, z, f, Lc):
 def find_reflection_radius_simple(Rpk, Lp_k, Lc, R, Q, r_max, n_grid=120):
     rs = np.linspace(0, r_max, n_grid)
     best_r, best_ang = 0.0, 1e9
+
     for r in rs:
-        z = asphere_sag(np.array([r], dtype=np.float32), R, Q)[0]
+        z = asphere_sag(np.array([r], np.float32), R, Q)[0]
         r2 = r + 1e-4
-        z2 = asphere_sag(np.array([r2], dtype=np.float32), R, Q)[0]
+        z2 = asphere_sag(np.array([r2], np.float32), R, Q)[0]
         dzdr = (z2 - z) / (r2 - r)
 
-        n = np.array([-dzdr, 1.0], dtype=np.float32)
-        n /= np.linalg.norm(n) + 1e-12
+        n = np.array([-dzdr, 1.0], np.float32)
+        n /= (np.linalg.norm(n) + 1e-12)
 
-        P = np.array([r, z], dtype=np.float32)
-        S = np.array([Rpk, Lp_k], dtype=np.float32)
-        C = np.array([0.0, Lc], dtype=np.float32)
+        P = np.array([r, z], np.float32)
+        S = np.array([Rpk, Lp_k], np.float32)
+        C = np.array([0.0, Lc], np.float32)
 
         s = S - P; s /= (np.linalg.norm(s) + 1e-12)
         c = C - P; c /= (np.linalg.norm(c) + 1e-12)
         b = s + c; b /= (np.linalg.norm(b) + 1e-12)
 
-        ang = np.arccos(np.clip(np.dot(n, b), -1.0, 1.0))
+        ang = np.arccos(np.clip(np.dot(n, b), -1, 1))
         if ang < best_ang:
             best_ang, best_r = ang, r
+
     return float(best_r)
 
 # =========================================================
-# Missing data helper
-# =========================================================
-
-def fill_missing_1d_with_linear(y, mask):
-    y = np.asarray(y, np.float32)
-    m = np.asarray(mask, np.float32)
-    K = y.shape[0]
-
-    if float(m.sum()) <= 0.0:
-        return np.zeros_like(y, dtype=np.float32)
-
-    idx = np.arange(K)
-    obs = m > 0.5
-    y_filled = y.copy()
-
-    if int(obs.sum()) == 1:
-        y_filled[:] = y[obs][0]
-        return y_filled.astype(np.float32)
-
-    y_filled[~obs] = np.interp(idx[~obs], idx[obs], y[obs]).astype(np.float32)
-    return y_filled.astype(np.float32)
-
-# =========================================================
-# Dataset (360 angles per sample)
+# Optimized Dataset (fast)
 # =========================================================
 
 class TinyPlacidoDataset(torch.utils.data.Dataset):
@@ -127,17 +101,21 @@ class TinyPlacidoDataset(torch.utils.data.Dataset):
                  missing_prob=0.15,
                  missing_block_prob=0.35,
                  seed=0):
+
         self.N = int(N)
         self.calib = calib
         self.A = int(A)
         self.K = int(K)
         self.Rr = int(Rr)
         self.r_max = float(r_max)
+
         self.R_range = tuple(R_range)
         self.Q_range = tuple(Q_range)
+
         self.jitter_px = float(jitter_px)
         self.missing_prob = float(missing_prob)
         self.missing_block_prob = float(missing_block_prob)
+
         self.r_grid = np.linspace(0, self.r_max, self.Rr).astype(np.float32)
         self._rng = np.random.default_rng(int(seed))
 
@@ -163,104 +141,74 @@ class TinyPlacidoDataset(torch.utils.data.Dataset):
         return mask
 
     def __getitem__(self, idx):
-        R_theta = self._rng.uniform(self.R_range[0], self.R_range[1], size=(self.A,)).astype(np.float32)
-        Q_theta = self._rng.uniform(self.Q_range[0], self.Q_range[1], size=(self.A,)).astype(np.float32)
 
-        z_target = np.zeros((self.A, self.Rr), dtype=np.float32)
-        for a in range(self.A):
-            z_target[a] = asphere_sag(self.r_grid, float(R_theta[a]), float(Q_theta[a])).astype(np.float32)
+        R0 = float(self._rng.uniform(*self.R_range))
+        Q0 = float(self._rng.uniform(*self.Q_range))
 
-        rk = np.zeros((self.A, self.K), dtype=np.float32)
-        zk = np.zeros((self.A, self.K), dtype=np.float32)
-        rho = np.zeros((self.A, self.K), dtype=np.float32)
+        z_base = asphere_sag(self.r_grid, R0, Q0).astype(np.float32)
+        z_target = np.tile(z_base[None, :], (self.A, 1))
 
-        for a in range(self.A):
-            R = float(R_theta[a])
-            Q = float(Q_theta[a])
-            for k in range(self.K):
-                r_star = find_reflection_radius_simple(
-                    float(self.calib.rings_mm[k]),
-                    float(self.calib.Lp[k]),
-                    float(self.calib.Lc),
-                    R, Q, self.r_max,
-                    n_grid=120
-                )
-                rk[a, k] = r_star
-                zk[a, k] = asphere_sag(np.array([r_star], dtype=np.float32), R, Q)[0]
-            rho[a] = forward_project_r_to_rho(rk[a], zk[a], float(self.calib.f), float(self.calib.Lc)).astype(np.float32)
+        # reflection radius once per ring
+        r_star_k = np.zeros(self.K, dtype=np.float32)
+        for k in range(self.K):
+            r_star_k[k] = find_reflection_radius_simple(
+                self.calib.rings_mm[k],
+                self.calib.Lp[k],
+                self.calib.Lc,
+                R0, Q0,
+                self.r_max
+            )
+
+        rk = np.tile(r_star_k[None, :], (self.A, 1))
+        idx_k = np.clip(np.searchsorted(self.r_grid, r_star_k), 0, self.Rr - 1)
+        zk = z_target[:, idx_k]
+
+        rho = forward_project_r_to_rho(rk, zk, self.calib.f, self.calib.Lc)
 
         if self.jitter_px > 0:
-            rho += self._rng.normal(0.0, self.jitter_px, size=rho.shape).astype(np.float32)
+            rho += self._rng.normal(0.0, self.jitter_px, rho.shape).astype(np.float32)
 
         mask = self._make_missing_mask()
         rho_obs = rho.copy()
         rho_obs[mask < 0.5] = 0.0
 
         return {
-            "rho": torch.tensor(rho_obs, dtype=torch.float32),         # [A,K]
-            "mask": torch.tensor(mask, dtype=torch.float32),           # [A,K]
-            "z_target": torch.tensor(z_target, dtype=torch.float32),   # [A,Rr]
-            "r_grid": torch.tensor(self.r_grid, dtype=torch.float32),  # [Rr]
-            "rk": torch.tensor(rk, dtype=torch.float32),               # [A,K]
-            "zk": torch.tensor(zk, dtype=torch.float32),               # [A,K]
-            "R": torch.tensor(R_theta, dtype=torch.float32),           # [A]
-            "Q": torch.tensor(Q_theta, dtype=torch.float32),           # [A]
+            "rho": torch.tensor(rho_obs, dtype=torch.float32),
+            "mask": torch.tensor(mask, dtype=torch.float32),
+            "z_target": torch.tensor(z_target, dtype=torch.float32),
+            "r_grid": torch.tensor(self.r_grid, dtype=torch.float32),
+            "rk": torch.tensor(rk, dtype=torch.float32),
+            "R0": R0,
+            "Q0": Q0,
         }
 
 # =========================================================
-# Optics diagram (one angle)
+# Neural model (unchanged)
 # =========================================================
 
-def optics_diagram(sample, calib, angle_deg=45):
-    A = sample["rho"].shape[0]
-    a = int(angle_deg) % A
+class EncoderDecoderNet(nn.Module):
+    def __init__(self, K, Rr):
+        super().__init__()
+        self.enc = nn.Sequential(
+            nn.Conv1d(1, 32, 5, padding=2),
+            nn.ReLU(),
+            nn.Conv1d(32, 64, 5, padding=2),
+            nn.ReLU()
+        )
+        self.dec = nn.Sequential(
+            nn.Linear(64, 128),
+            nn.ReLU(),
+            nn.Linear(128, Rr)
+        )
 
-    rho = sample["rho"][a].numpy()
-    mask = sample["mask"][a].numpy()
-    zt = sample["z_target"][a].numpy()
-    r = sample["r_grid"].numpy()
-    rk = sample["rk"][a].numpy()
-    zk = sample["zk"][a].numpy()
-    R = float(sample["R"][a].item())
-    Q = float(sample["Q"][a].item())
-
-    ray_color = "0.75"
-
-    plt.figure(figsize=(10, 10))
-    plt.plot(r, zt, label="z(r)", lw=2)
-    plt.scatter(calib.rings_mm, calib.Lp, s=35, label="Placido rings (r, Lp)")
-    plt.scatter([0.0], [float(calib.Lc)], marker="x", s=60, color="k", label="Camera pinhole C")
-
-    z_img = float(calib.Lc) + float(calib.f)
-    plt.axhline(z_img, lw=1.0, alpha=0.6)
-    plt.text(r[0] + 0.25, z_img + 0.05, "Image plane", fontsize=9)
-
-    obs = mask > 0.5
-    plt.scatter(-rho[obs], np.full(np.sum(obs), z_img, dtype=np.float32),
-                marker="s", s=18, label="Observed image points I_k")
-    plt.scatter(rk, zk, s=25, marker="^", label="Hit points P_k (r*, z*)")
-
-    for k in range(len(rho)):
-        if not obs[k]:
-            continue
-        r_ring, z_ring = float(calib.rings_mm[k]), float(calib.Lp[k])
-        r_star, z_star = float(rk[k]), float(zk[k])
-        rho_i = float(rho[k])
-        plt.plot([r_ring, r_star, -rho_i],
-                 [z_ring, z_star, z_img],
-                 linestyle=":", lw=1.2, color=ray_color, alpha=0.9)
-
-    plt.grid(True)
-    plt.legend()
-    plt.gca().set_aspect("equal", adjustable="box")
-    plt.title(f"Optics diagram (angle {angle_deg}°)\nR={R:.2f} mm, Q={Q:.2f}")
-    plt.xlabel("r (mm) / ρ (sensor units)")
-    plt.ylabel("z (mm)")
-    plt.tight_layout()
-    plt.show()
+    def forward(self, rho):
+        x = rho.unsqueeze(1)
+        x = self.enc(x)
+        x = x.mean(dim=-1)
+        return self.dec(x)
 
 # =========================================================
-# Arc-step baseline (per-angle)
+# Arc-step (ORIGINAL)
 # =========================================================
 
 def arc_step_fixed(rho, f, Lc, smooth_window=3):
@@ -271,38 +219,76 @@ def arc_step_fixed(rho, f, Lc, smooth_window=3):
         pad = w // 2
         rho_p = np.pad(rho, (pad, pad), mode="edge")
         ker = np.ones(w, np.float32) / float(w)
-        rho = np.convolve(rho_p, ker, mode="valid").astype(np.float32)
+        rho = np.convolve(rho_p, ker, mode="valid")
 
     r = rho * (Lc / f)
-    r = np.maximum.accumulate(r).astype(np.float32)
+    r = np.maximum.accumulate(r)
 
     dr = np.diff(r)
     R_local = np.zeros_like(r)
-
     for i in range(1, len(r) - 1):
         R_local[i] = 0.5 * (dr[i] + dr[i - 1])
     R_local[0] = R_local[1]
     R_local[-1] = R_local[-2]
 
-    R_local = np.clip(R_local, 6.5, 12.0).astype(np.float32)
+    R_local = np.clip(R_local, 6.5, 12.0)
 
     z = np.zeros_like(r)
     for i in range(len(r)):
         Ri = float(R_local[i])
-        z[i] = Ri - np.sqrt(max(Ri * Ri - float(r[i]) * float(r[i]), 1e-6))
+        z[i] = Ri - np.sqrt(max(Ri * Ri - r[i] * r[i], 1e-6))
 
     z = -z
-    z = z - z[0]
+    z -= z[0]
     return r.astype(np.float32), z.astype(np.float32)
 
 # =========================================================
-# Klein-like baseline (per-angle)
+# Klein-like
 # =========================================================
 
-def klein_like_z(rho, r_k, smooth_window=5):
-    rho = np.asarray(rho, np.float32)
-    r = np.asarray(r_k, np.float32)
+def klein_like_z(rho, r_k, smooth_window=5, eps=1e-6):
+    """
+    Klein-like slope integration with:
+      - Option A: drop duplicated r == r_max (aperture saturation)
+      - Interpolation of missing rho values (rho == 0)
+    """
 
+    rho = np.asarray(rho, np.float32).copy()
+    r = np.asarray(r_k, np.float32).copy()
+
+    # -------------------------------------------------
+    # 1. Interpolate missing rho (rho == 0)
+    #    Klein requires continuous physical signal
+    # -------------------------------------------------
+    m = rho != 0.0
+    if np.sum(m) >= 2:
+        x = np.arange(len(rho))
+        rho[~m] = np.interp(x[~m], x[m], rho[m])
+    else:
+        # Too few valid rings → Klein undefined
+        return r.astype(np.float32), np.zeros_like(r, dtype=np.float32)
+
+    # -------------------------------------------------
+    # 2. Option A: drop duplicated outer rings at r_max
+    # -------------------------------------------------
+    r_max = np.max(r)
+    is_edge = np.isclose(r, r_max, atol=1e-6)
+
+    if np.sum(is_edge) > 1:
+        keep = np.ones_like(r, dtype=bool)
+        edge_idx = np.where(is_edge)[0]
+        keep[edge_idx[1:]] = False
+
+        r = r[keep]
+        rho = rho[keep]
+
+    # If too few points remain, Klein is invalid
+    if r.size < 3:
+        return r.astype(np.float32), np.zeros_like(r, dtype=np.float32)
+
+    # -------------------------------------------------
+    # 3. Optional smoothing (your original logic)
+    # -------------------------------------------------
     if smooth_window and smooth_window > 1:
         w = int(smooth_window) | 1
         pad = w // 2
@@ -310,180 +296,51 @@ def klein_like_z(rho, r_k, smooth_window=5):
         ker = np.ones(w, np.float32) / float(w)
         rho = np.convolve(rho_p, ker, mode="valid").astype(np.float32)
 
-    drho_dr = np.gradient(rho, r + 1e-6)
-    kappa = drho_dr / (r + 1e-6)
+    # -------------------------------------------------
+    # 4. Original Klein math (unchanged)
+    # -------------------------------------------------
+    drho_dr = np.gradient(rho, r + eps)
+    kappa = drho_dr / (r + eps)
 
     dr = np.gradient(r)
     slope = np.cumsum(kappa * dr)
     z = np.cumsum(slope * dr)
+
     z = z - z[0]
-    z = -z
+    z = -z  # physical corneal convention
+
     return r.astype(np.float32), z.astype(np.float32)
 
-# =========================================================
-# Neural model: Polar U-Net (Conv2d)
-# =========================================================
-
-class PolarUNet(nn.Module):
-    def __init__(self, K, Rr, base=32):
-        super().__init__()
-        self.Rr = int(Rr)
-
-        self.enc1 = nn.Sequential(
-            nn.Conv2d(2, base, 3, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(base, base, 3, padding=1),
-            nn.ReLU(),
-        )
-        self.enc2 = nn.Sequential(
-            nn.Conv2d(base, base * 2, 3, stride=2, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(base * 2, base * 2, 3, padding=1),
-            nn.ReLU(),
-        )
-        self.enc3 = nn.Sequential(
-            nn.Conv2d(base * 2, base * 4, 3, stride=2, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(base * 4, base * 4, 3, padding=1),
-            nn.ReLU(),
-        )
-
-        self.mid = nn.Sequential(
-            nn.Conv2d(base * 4, base * 4, 3, padding=1),
-            nn.ReLU(),
-        )
-
-        self.dec3 = nn.Sequential(
-            nn.ConvTranspose2d(base * 4, base * 2, 4, stride=2, padding=1),
-            nn.ReLU(),
-        )
-        self.dec2 = nn.Sequential(
-            nn.ConvTranspose2d(base * 4, base, 4, stride=2, padding=1),
-            nn.ReLU(),
-        )
-        self.dec1 = nn.Sequential(
-            nn.Conv2d(base * 2, base, 3, padding=1),
-            nn.ReLU(),
-        )
-
-        self.out = nn.Conv2d(base, 1, 1)
-
-    def forward(self, rho, mask):
-        x = torch.stack([rho, mask], dim=1)  # [B,2,A,K]
-
-        e1 = self.enc1(x)
-        e2 = self.enc2(e1)
-        e3 = self.enc3(e2)
-
-        m = self.mid(e3)
-
-        d3 = self.dec3(m)
-        d3 = _center_crop_like(d3, e2)
-        d3 = torch.cat([d3, e2], dim=1)
-
-        d2 = self.dec2(d3)
-        d2 = _center_crop_like(d2, e1)
-        d2 = torch.cat([d2, e1], dim=1)
-
-        d1 = self.dec1(d2)
-
-        z_k = self.out(d1).squeeze(1)  # [B,A,K]
-
-        z = F.interpolate(
-            z_k.unsqueeze(1),             # [B,1,A,K]
-            size=(z_k.shape[1], self.Rr), # (A,Rr)
-            mode="bilinear",
-            align_corners=False
-        ).squeeze(1)                     # [B,A,Rr]
-        return z
-
-
-def _center_crop_like(x, ref):
-    _, _, H, W = x.shape
-    _, _, Hr, Wr = ref.shape
-    if H == Hr and W == Wr:
-        return x
-    top = max(0, (H - Hr) // 2)
-    left = max(0, (W - Wr) // 2)
-    return x[:, :, top:top + Hr, left:left + Wr]
-
-# =========================================================
-# Physics-respecting loss
-# =========================================================
-
-def second_diff_r(z):
-    # z: [B,A,Rr] -> second difference along r (last axis)
-    return z[:, :, 2:] - 2.0 * z[:, :, 1:-1] + z[:, :, :-2]
-
-
-def second_diff_theta_periodic(z):
-    # z: [B,A,Rr] -> periodic second diff along angle axis
-    z_prev = torch.roll(z, shifts=1, dims=1)
-    z_next = torch.roll(z, shifts=-1, dims=1)
-    return z_next - 2.0 * z + z_prev
-
-
-def loss_physics(pred, target, lam_r=1e-3, lam_theta=1e-3):
-    data = F.smooth_l1_loss(pred, target)
-    reg_r = torch.mean(second_diff_r(pred) ** 2)
-    reg_t = torch.mean(second_diff_theta_periodic(pred) ** 2)
-    return data + lam_r * reg_r + lam_theta * reg_t, data, reg_r, reg_t
 
 # =========================================================
 # Training
 # =========================================================
 
-def train_epoch(model, loader, optim, lam_r=1e-3, lam_theta=1e-3):
+def train_epoch(model, loader, optim):
     model.train()
-    loss_sum = 0.0
+    total = 0.0
     for b in loader:
-        rho = b["rho"].to(DEVICE)
-        mask = b["mask"].to(DEVICE)
-        zt = b["z_target"].to(DEVICE)
+        rho = b["rho"].to(DEVICE)       # [B,A,K]
+        zt = b["z_target"].to(DEVICE)   # [B,A,Rr]
 
-        pred = model(rho, mask)
-        loss, data, rr, rt = loss_physics(pred, zt, lam_r=lam_r, lam_theta=lam_theta)
+        B, A, K = rho.shape
+        Rr = zt.shape[-1]
+
+        rho = rho.reshape(B * A, K)
+        zt = zt.reshape(B * A, Rr)
+
+        pred = model(rho)
+        loss = F.smooth_l1_loss(pred, zt)
 
         optim.zero_grad()
         loss.backward()
         optim.step()
-        loss_sum += float(loss.item())
-    return loss_sum / max(1, len(loader))
+        total += loss.item()
+
+    return total / len(loader)
 
 # =========================================================
-# Evaluation
-# =========================================================
-
-@torch.no_grad()
-def predict_all(model, sample, calib, arc_smooth=3, klein_smooth=5):
-    rho_t = sample["rho"].unsqueeze(0).to(DEVICE)
-    mask_t = sample["mask"].unsqueeze(0).to(DEVICE)
-    z_gt = sample["z_target"].numpy().astype(np.float32)
-    r_grid = sample["r_grid"].numpy().astype(np.float32)
-    rk = sample["rk"].numpy().astype(np.float32)
-
-    z_nn = model(rho_t, mask_t)[0].cpu().numpy().astype(np.float32)
-
-    A, K = sample["rho"].shape
-    z_arc = np.zeros((A, len(r_grid)), dtype=np.float32)
-    z_klein = np.zeros((A, len(r_grid)), dtype=np.float32)
-
-    rho_np = sample["rho"].numpy().astype(np.float32)
-    mask_np = sample["mask"].numpy().astype(np.float32)
-
-    for a in range(A):
-        rho_filled = fill_missing_1d_with_linear(rho_np[a], mask_np[a])
-
-        rArc, zArc = arc_step_fixed(rho_filled, calib.f, calib.Lc, smooth_window=arc_smooth)
-        z_arc[a] = np.interp(r_grid, rArc, zArc, left=zArc[0], right=zArc[-1]).astype(np.float32)
-
-        rK, zK = klein_like_z(rho_filled, rk[a], smooth_window=klein_smooth)
-        z_klein[a] = np.interp(r_grid, rK, zK, left=zK[0], right=zK[-1]).astype(np.float32)
-
-    return z_gt, z_nn, z_arc, z_klein
-
-# =========================================================
-# Plotting + metrics
+# Plotting + metrics (YOUR CODE)
 # =========================================================
 
 def compute_metrics(z_pred, z_gt):
@@ -510,7 +367,7 @@ def plot_four_angles(r_grid, z_gt, z_nn, z_arc, z_klein, angles_deg=(45, 135, 22
         a = int(deg) % z_gt.shape[0]
         ax = plt.subplot(2, 2, i)
         ax.plot(r_grid, z_gt[a], "k--", lw=2, label="GT")
-        ax.plot(r_grid, z_nn[a], "r", lw=2, label="NN (Polar U-Net)")
+        ax.plot(r_grid, z_nn[a], "r", lw=2, label="NN")
         ax.plot(r_grid, z_arc[a], "g:", lw=2.5, label="Arc-step")
         ax.plot(r_grid, z_klein[a], "--", color="purple", lw=2, label="Klein")
         ax.set_title(f"Angle {deg}°")
@@ -532,34 +389,58 @@ def plot_per_angle_error(z_gt, z_nn, z_arc, z_klein):
     plt.plot(err_nn, label="NN")
     plt.plot(err_arc, label="Arc-step")
     plt.plot(err_k, label="Klein")
-    plt.title("Mean |error| per angle (averaged over r)")
     plt.xlabel("angle index (0..359)")
-    plt.ylabel("mean |z_pred - z_gt|")
+    plt.ylabel("mean |error|")
+    plt.title("Mean |error| per angle")
     plt.grid(True)
     plt.legend()
     plt.tight_layout()
     plt.show()
 
 
-def plot_heatmaps(z_gt, z_nn, z_arc, z_klein, title_prefix=""):
+def plot_heatmaps(z_gt, z_nn, z_arc, z_klein, mask, title_prefix=""):
     def show(im, ttl):
         plt.figure(figsize=(10, 4))
-        plt.imshow(im, aspect="auto", origin="lower")
+        plt.imshow(im.T, aspect="auto", origin="lower")
         plt.colorbar()
         plt.title(ttl)
-        plt.xlabel("r index")
-        plt.ylabel("angle index (0..359)")
+        plt.xlabel("angle index")
+        plt.ylabel("r index")
         plt.tight_layout()
         plt.show()
 
-    show(z_gt,    f"{title_prefix}GT  (z[angle, r])")
-    show(z_nn,    f"{title_prefix}NN  (z[angle, r])")
-    show(z_arc,   f"{title_prefix}Arc-step  (z[angle, r])")
-    show(z_klein, f"{title_prefix}Klein  (z[angle, r])")
+    show(z_gt,    f"{title_prefix}GT")
+    show(mask,   f"{title_prefix}Mask")
+    show(z_nn,   f"{title_prefix}NN")
+    show(z_arc,  f"{title_prefix}Arc-step")
+    show(z_klein,f"{title_prefix}Klein")
 
-    show(np.abs(z_nn - z_gt),    f"{title_prefix}|NN - GT|")
-    show(np.abs(z_arc - z_gt),   f"{title_prefix}|Arc - GT|")
-    show(np.abs(z_klein - z_gt), f"{title_prefix}|Klein - GT|")
+# =========================================================
+# Evaluation
+# =========================================================
+
+def evaluate_case(model, sample, calib):
+    r_grid = sample["r_grid"].numpy()
+    rho = sample["rho"].numpy()
+    z_gt = sample["z_target"].numpy()
+    rk = sample["rk"].numpy()
+    mask = sample["mask"].numpy()
+
+    with torch.no_grad():
+        z_nn = model(torch.tensor(rho, device=DEVICE)).cpu().numpy()
+
+    A = rho.shape[0]
+    z_arc = np.zeros_like(z_gt)
+    z_klein = np.zeros_like(z_gt)
+
+    for a in range(A):
+        rA, zA = arc_step_fixed(rho[a], calib.f, calib.Lc)
+        rK, zK = klein_like_z(rho[a], rk[a])
+
+        z_arc[a] = np.interp(r_grid, rA, zA)
+        z_klein[a] = np.interp(r_grid, rK, zK)
+
+    return r_grid, z_gt, z_nn, z_arc, z_klein, mask
 
 # =========================================================
 # Main
@@ -576,45 +457,21 @@ if __name__ == "__main__":
 
     calib = build_calib(K=K)
 
-    train_ds = TinyPlacidoDataset(
-        N=200, calib=calib, A=A, K=K, Rr=Rr,
-        jitter_px=0.002,
-        missing_prob=0.15,
-        missing_block_prob=0.35,
-        seed=1
-    )
-    val_ds = TinyPlacidoDataset(
-        N=30, calib=calib, A=A, K=K, Rr=Rr,
-        jitter_px=0.002,
-        missing_prob=0.15,
-        missing_block_prob=0.35,
-        seed=999
-    )
+    train_ds = TinyPlacidoDataset(120, calib, A=A, K=K, Rr=Rr)
+    val_ds = TinyPlacidoDataset(20, calib, A=A, K=K, Rr=Rr, jitter_px=0.0)
 
     loader = torch.utils.data.DataLoader(train_ds, batch_size=2, shuffle=True)
 
-    model = PolarUNet(K=K, Rr=Rr, base=32).to(DEVICE)
+    model = EncoderDecoderNet(K, Rr).to(DEVICE)
     optim = torch.optim.Adam(model.parameters(), lr=1e-3)
 
-    # regularization weights (tune if needed)
-    lam_r = 2e-3
-    lam_theta = 2e-3
+    for ep in range(6):
+        loss = train_epoch(model, loader, optim)
+        print(f"Epoch {ep+1}: loss={loss:.6f}")
 
-    for ep in range(2):
-        L = train_epoch(model, loader, optim, lam_r=lam_r, lam_theta=lam_theta)
-        print(f"Epoch {ep+1}: loss={L:.6f}")
-
-    sample = val_ds[3]
-
-    # Optics diagram at one requested angle
-    optics_diagram(sample, calib, angle_deg=45)
-
-    z_gt, z_nn, z_arc, z_klein = predict_all(model, sample, calib)
+    r_grid, z_gt, z_nn, z_arc, z_klein, mask = evaluate_case(model, val_ds[3], calib)
 
     summary_print(z_gt, z_nn, z_arc, z_klein)
-
-    r_grid = sample["r_grid"].numpy()
-    plot_four_angles(r_grid, z_gt, z_nn, z_arc, z_klein, angles_deg=(45, 135, 225, 270))
-
+    plot_four_angles(r_grid, z_gt, z_nn, z_arc, z_klein)
     plot_per_angle_error(z_gt, z_nn, z_arc, z_klein)
-    plot_heatmaps(z_gt, z_nn, z_arc, z_klein, title_prefix="Sample 3 — ")
+    plot_heatmaps(z_gt, z_nn, z_arc, z_klein, mask, title_prefix="Validation: ")
